@@ -3,37 +3,33 @@ name: Azure Marketplace Release
 # Publishes the amazon-cloudwatch-observability chart to Azure Marketplace as a
 # Kubernetes application (CNAB bundle).
 #
-#   0. Detect a new upstream agent release and decide whether to run at all
 #   1. Build the Marketplace bundle with CPA and push it to ACR
 #   2. Replace the plan's technical-configuration package (delete + add)
 #   3. Verify the digest Partner Center reports matches what we built
-#   4. Record the published version so the next poll does not republish it
 #
 # Final publication stays MANUAL in Partner Center once Azure-side validation
 # passes. This workflow never calls go-live.
 #
-# TRIGGERING
-# ----------
-# The release signal is a new tag on aws/amazon-cloudwatch-agent, which is a
-# repository we do not own. GitHub Actions cannot subscribe to another repo's
-# events, so this polls the upstream Releases API on a schedule. If upstream
-# (or an intermediary we control) ever sends us a webhook, the
-# repository_dispatch trigger below picks it up with no changes here.
+# TRIGGER
+# -------
+# A chart release tag pushed to this repo: amazon-cloudwatch-observability-x.y.z
+# The x.y.z in the tag is the Marketplace plan version, and it must match the
+# version in Chart.yaml at the tagged commit - see "Resolve release version".
+#
+# To re-run a release by hand, open "Run workflow" and pick the release TAG as
+# the ref (not main), otherwise the checkout and the version will not agree.
 #
 # Auth is GitHub OIDC -> Microsoft Entra ID (no long-lived secrets):
 #   https://learn.microsoft.com/en-us/azure/developer/github/connect-from-azure-openid-connect
 
 on:
-  schedule:
-    # Every 6 hours. GitHub may delay or drop scheduled runs on a busy repo,
-    # so this is a "within hours" guarantee, not a punctual one.
-    - cron: '0 */6 * * *'
-  repository_dispatch:
-    types: [amazon-cloudwatch-agent-release]
+  push:
+    tags:
+      - 'amazon-cloudwatch-observability-*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Publish this exact version (x.y.z) and SKIP the upstream/duplicate checks'
+        description: 'Release tag to publish (defaults to the selected ref)'
         required: false
         type: string
       dry_run:
@@ -59,164 +55,13 @@ env:
   CHART_NAME: amazon-cloudwatch-observability
   CHART_SRC: charts/amazon-cloudwatch-observability
   CPA_IMAGE: mcr.microsoft.com/container-package-app:latest
-  UPSTREAM_REPO: aws/amazon-cloudwatch-agent
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 0. Decide whether there is anything to publish.
-  #
-  # An upstream agent release is the SIGNAL, but it is not sufficient on its
-  # own: the chart pins a specific agent build in values.yaml, and until
-  # someone bumps that pin the chart still ships the previous agent. Publishing
-  # on the bare upstream tag would push a stale chart to the Marketplace under
-  # a new version number. So the gate is:
-  #
-  #   upstream has a new release  AND  the chart already pins it  AND
-  #   this chart version has not been published before
-  #
-  # A "not yet" result is a clean no-op, not a failure - nothing is broken,
-  # the chart simply has not caught up yet.
-  # ---------------------------------------------------------------------------
-  detect-release:
-    name: Check for a new upstream release
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      should_run: ${{ steps.gate.outputs.should_run }}
-      version: ${{ steps.gate.outputs.version }}
-      upstream_tag: ${{ steps.gate.outputs.upstream_tag }}
-      agent_tag: ${{ steps.gate.outputs.agent_tag }}
-      dry_run: ${{ steps.gate.outputs.dry_run }}
-      reason: ${{ steps.gate.outputs.reason }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
-        with:
-          fetch-depth: 0
-
-      - name: Evaluate release gate
-        id: gate
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MANUAL_TAG: ${{ inputs.tag }}
-          DISPATCH_TAG: ${{ github.event.client_payload.tag }}
-          INPUT_DRY_RUN: ${{ inputs.dry_run }}
-        run: |
-          set -euo pipefail
-
-          # A scheduled or dispatched run is a real release; only an explicit
-          # workflow_dispatch can ask for a dry run.
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            DRY_RUN="${INPUT_DRY_RUN:-true}"
-          else
-            DRY_RUN=false
-          fi
-          echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
-
-          skip() {
-            echo "should_run=false" >> "$GITHUB_OUTPUT"
-            echo "reason=$1"        >> "$GITHUB_OUTPUT"
-            echo "::notice::no publish: $1"
-            { echo "### No publish"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          }
-
-          # The Marketplace plan is versioned by the CHART, not by the agent.
-          # The agent version is an implementation detail of the chart.
-          CHART_VERSION=$(grep -E '^version:' "${CHART_SRC}/Chart.yaml" \
-            | head -1 | awk '{print $2}' | tr -d '"')
-          if [[ ! "$CHART_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Chart.yaml version '$CHART_VERSION' is not a Marketplace version (x.y.z)"
-            exit 1
-          fi
-
-          # --- manual override: publish exactly what was asked, no gate ------
-          if [[ -n "${MANUAL_TAG:-}" ]]; then
-            VERSION="${MANUAL_TAG#v}"
-            if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "::error::input tag '$MANUAL_TAG' is not a Marketplace version (x.y.z)"
-              exit 1
-            fi
-            echo "should_run=true"              >> "$GITHUB_OUTPUT"
-            echo "version=$VERSION"             >> "$GITHUB_OUTPUT"
-            echo "upstream_tag=(manual)"        >> "$GITHUB_OUTPUT"
-            echo "agent_tag=(not checked)"      >> "$GITHUB_OUTPUT"
-            echo "reason=manual run for $VERSION (gate bypassed)" >> "$GITHUB_OUTPUT"
-            echo "::warning::manual run - upstream and duplicate checks were skipped"
-            exit 0
-          fi
-
-          # --- 1. newest upstream release ------------------------------------
-          # /releases/latest already excludes drafts and prereleases.
-          if [[ -n "${DISPATCH_TAG:-}" ]]; then
-            UPSTREAM_TAG="$DISPATCH_TAG"
-            echo "Upstream tag supplied by repository_dispatch: $UPSTREAM_TAG"
-          else
-            UPSTREAM_TAG=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name')
-          fi
-          if [[ -z "$UPSTREAM_TAG" ]]; then
-            echo "::error::could not read the latest release of ${UPSTREAM_REPO}"
-            exit 1
-          fi
-          UPSTREAM_VERSION="${UPSTREAM_TAG#v}"
-          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
-
-          # --- 2. which agent build does the chart actually pin? -------------
-          # PyYAML ships with the runner image; the fallbacks cover a future
-          # image where it does not (PEP 668 makes a plain install fail).
-          python3 -c 'import yaml' 2>/dev/null \
-            || pip install --quiet pyyaml \
-            || pip install --quiet --break-system-packages pyyaml
-          AGENT_TAG=$(python3 - <<'PY'
-          import os, yaml
-          with open(os.path.join(os.environ["CHART_SRC"], "values.yaml")) as fh:
-              print(yaml.safe_load(fh)["agent"]["image"]["tag"])
-          PY
-          )
-          if [[ -z "$AGENT_TAG" ]]; then
-            echo "::error::could not read agent.image.tag from ${CHART_SRC}/values.yaml"
-            exit 1
-          fi
-          echo "agent_tag=$AGENT_TAG" >> "$GITHUB_OUTPUT"
-          # Chart tags carry a build suffix: 1.300073.0b1828 -> 1.300073.0
-          AGENT_VERSION="${AGENT_TAG%%b*}"
-
-          echo "upstream release : $UPSTREAM_TAG  (version $UPSTREAM_VERSION)"
-          echo "chart agent pin  : $AGENT_TAG     (version $AGENT_VERSION)"
-          echo "chart version    : $CHART_VERSION"
-
-          if [[ "$AGENT_VERSION" != "$UPSTREAM_VERSION" ]]; then
-            skip "upstream is at ${UPSTREAM_TAG} but the chart still pins agent ${AGENT_TAG}. Bump agent.image.tag (and the chart version) first."
-          fi
-
-          # --- 3. has this chart version already been published? -------------
-          MARKER="marketplace/${CHART_VERSION}"
-          if git ls-remote --exit-code --tags origin "refs/tags/${MARKER}" >/dev/null 2>&1; then
-            skip "chart ${CHART_VERSION} was already published (marker tag ${MARKER} exists). Bump the chart version to publish again."
-          fi
-
-          echo "should_run=true"      >> "$GITHUB_OUTPUT"
-          echo "version=$CHART_VERSION" >> "$GITHUB_OUTPUT"
-          echo "reason=upstream ${UPSTREAM_TAG} is pinned by chart ${CHART_VERSION}" >> "$GITHUB_OUTPUT"
-          {
-            echo "### Release detected"
-            echo ""
-            echo "| | |"
-            echo "|---|---|"
-            echo "| upstream release | \`${UPSTREAM_TAG}\` |"
-            echo "| chart agent pin | \`${AGENT_TAG}\` |"
-            echo "| chart version (publishing as) | \`${CHART_VERSION}\` |"
-            echo "| dry run | \`${DRY_RUN}\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # ---------------------------------------------------------------------------
-  # Fires immediately so the team knows a release started. Deliberately does NOT
-  # fire on a poll that found nothing, or Slack would get 4 no-op pings a day.
+  # Fires immediately so the team knows a release started.
   # ---------------------------------------------------------------------------
   notify-start:
     name: Notify - started
-    needs: detect-release
-    if: needs.detect-release.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Mapped at job level: the `secrets` context is not available in step `if`.
@@ -232,11 +77,8 @@ jobs:
           payload: |
             {
               "text": ":rocket: Azure Marketplace release started",
-              "version": "${{ needs.detect-release.outputs.version }}",
-              "upstream_release": "${{ needs.detect-release.outputs.upstream_tag }}",
-              "agent_image_tag": "${{ needs.detect-release.outputs.agent_tag }}",
-              "trigger": "${{ github.event_name }}",
-              "dry_run": "${{ needs.detect-release.outputs.dry_run }}",
+              "tag": "${{ inputs.tag || github.ref_name }}",
+              "dry_run": "${{ inputs.dry_run || false }}",
               "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             }
 
@@ -245,20 +87,49 @@ jobs:
   # ---------------------------------------------------------------------------
   build-bundle:
     name: Build bundle and push to ACR
-    needs: detect-release
-    if: needs.detect-release.outputs.should_run == 'true'
     # ubuntu-latest is linux/amd64 with Docker preinstalled, which CPA requires.
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
+      version: ${{ steps.meta.outputs.version }}
       digest: ${{ steps.digest.outputs.digest }}
-    env:
-      VERSION: ${{ needs.detect-release.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
         with:
           fetch-depth: 0
+
+      - name: Resolve release version
+        id: meta
+        env:
+          RAW: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${RAW:-}" ]]; then
+            echo "::error::could not determine a release tag"
+            exit 1
+          fi
+
+          # amazon-cloudwatch-observability-6.7.0 -> 6.7.0
+          VERSION="${RAW#${CHART_NAME}-}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'${RAW}' is not a chart release tag. Expected ${CHART_NAME}-x.y.z"
+            echo "::error::(running from a branch? pick the release tag as the ref in \"Run workflow\")"
+            exit 1
+          fi
+
+          # The tag names a chart version, so the tagged tree must agree with it.
+          # A mismatch means the wrong commit was tagged, and shipping it would
+          # put the wrong chart behind that Marketplace version.
+          CHART_VERSION=$(grep -E '^version:' "${CHART_SRC}/Chart.yaml" \
+            | head -1 | awk '{print $2}' | tr -d '"')
+          if [[ "$CHART_VERSION" != "$VERSION" ]]; then
+            echo "::error::tag says ${VERSION} but ${CHART_SRC}/Chart.yaml at this ref says ${CHART_VERSION}"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing chart version ${VERSION} (tag ${RAW})"
 
       - name: Verify expected repo layout
         run: |
@@ -276,6 +147,8 @@ jobs:
           echo "Layout OK"
 
       - name: Stage chart into azure/
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
           DEST="${AZURE_DIR}/${CHART_NAME}"
@@ -289,23 +162,16 @@ jobs:
           [[ -f "${DEST}/values.yaml" ]] || { echo "::error::staging failed: ${DEST}/values.yaml"; exit 1; }
           [[ -d "${DEST}/templates" ]]   || { echo "::error::staging failed: ${DEST}/templates"; exit 1; }
 
-          CHART_VERSION=$(grep -E '^version:' "${DEST}/Chart.yaml" | head -1 | awk '{print $2}' | tr -d '"')
-          echo "Staged ${CHART_SRC} -> ${DEST} (chart version ${CHART_VERSION})"
-
-          # On a gated run these are equal by construction; on a manual run with
-          # an explicit tag they may not be, and that is worth seeing.
-          if [[ "$CHART_VERSION" != "$VERSION" ]]; then
-            echo "::warning::chart version ${CHART_VERSION} != publish version ${VERSION}"
-          fi
+          echo "Staged ${CHART_SRC} -> ${DEST}"
           {
             echo "### Chart staged"
             echo ""
             echo "| | |"
             echo "|---|---|"
+            echo "| tag | \`${{ inputs.tag || github.ref_name }}\` |"
             echo "| source | \`${CHART_SRC}\` |"
             echo "| destination | \`${DEST}\` |"
-            echo "| chart version | \`${CHART_VERSION}\` |"
-            echo "| publish version | \`${VERSION}\` |"
+            echo "| version | \`${VERSION}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Azure login (OIDC)
@@ -336,6 +202,8 @@ jobs:
 
       - name: Resolve bundle digest from ACR
         id: digest
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
           REPO="${{ vars.ACR_REPOSITORY }}"
@@ -365,15 +233,13 @@ jobs:
   # ---------------------------------------------------------------------------
   update-package:
     name: Replace Marketplace package
-    needs: [detect-release, build-bundle]
-    if: >-
-      needs.detect-release.outputs.should_run == 'true' &&
-      needs.detect-release.outputs.dry_run != 'true'
+    needs: build-bundle
+    if: ${{ !(inputs.dry_run || false) }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     environment: azure-marketplace # gate reviewers/secrets here if desired
     env:
-      VERSION: ${{ needs.detect-release.outputs.version }}
+      VERSION: ${{ needs.build-bundle.outputs.version }}
     steps:
       - name: Azure login (OIDC)
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
@@ -428,10 +294,8 @@ jobs:
   # ---------------------------------------------------------------------------
   verify-sha:
     name: Verify package SHA
-    needs: [detect-release, build-bundle, update-package]
-    if: >-
-      needs.detect-release.outputs.should_run == 'true' &&
-      needs.detect-release.outputs.dry_run != 'true'
+    needs: [build-bundle, update-package]
+    if: ${{ !(inputs.dry_run || false) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -494,55 +358,12 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
-  # 4. Record what was published.
-  #
-  # This marker tag is what stops the next poll from republishing the same
-  # chart. It is written ONLY after every preceding stage succeeded, so a run
-  # that dies halfway leaves no marker and the next poll retries it.
-  # ---------------------------------------------------------------------------
-  record-release:
-    name: Record published version
-    needs: [detect-release, build-bundle, update-package, verify-sha]
-    if: >-
-      needs.detect-release.outputs.should_run == 'true' &&
-      needs.detect-release.outputs.dry_run != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write # push the marker tag
-    steps:
-      - name: Checkout
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
-
-      - name: Tag the published version
-        env:
-          VERSION: ${{ needs.detect-release.outputs.version }}
-          UPSTREAM_TAG: ${{ needs.detect-release.outputs.upstream_tag }}
-          DIGEST: ${{ needs.build-bundle.outputs.digest }}
-        run: |
-          set -euo pipefail
-          MARKER="marketplace/${VERSION}"
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$MARKER" -m "Azure Marketplace package for chart ${VERSION}
-
-          upstream release: ${UPSTREAM_TAG}
-          bundle digest:    ${DIGEST}
-          run:              ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          git push origin "$MARKER"
-          echo "Recorded $MARKER"
-
-  # ---------------------------------------------------------------------------
-  # Always reports, including on failure, cancellation and timeout. Stays silent
-  # on a poll that found nothing to do.
+  # Always reports, including on failure, cancellation and timeout.
   # ---------------------------------------------------------------------------
   notify-result:
     name: Notify - result
-    needs: [detect-release, build-bundle, update-package, verify-sha, record-release]
-    if: >-
-      always() &&
-      (needs.detect-release.outputs.should_run == 'true' ||
-       needs.detect-release.result == 'failure')
+    needs: [build-bundle, update-package, verify-sha]
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
@@ -558,7 +379,7 @@ jobs:
                 "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
             echo "state=failure" >> "$GITHUB_OUTPUT"
             echo "text=:x: Azure Marketplace release FAILED - pipeline stopped" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ needs.detect-release.outputs.dry_run }}" == "true" ]]; then
+          elif [[ "${{ inputs.dry_run || false }}" == "true" ]]; then
             echo "state=success" >> "$GITHUB_OUTPUT"
             echo "text=:test_tube: Azure Marketplace DRY RUN complete - bundle in ACR, Partner Center untouched" >> "$GITHUB_OUTPUT"
           else
@@ -575,13 +396,11 @@ jobs:
           payload: |
             {
               "text": "${{ steps.outcome.outputs.text }}",
-              "version": "${{ needs.detect-release.outputs.version }}",
-              "upstream_release": "${{ needs.detect-release.outputs.upstream_tag }}",
-              "detect": "${{ needs.detect-release.result }}",
+              "tag": "${{ inputs.tag || github.ref_name }}",
+              "version": "${{ needs.build-bundle.outputs.version }}",
               "build": "${{ needs.build-bundle.result }}",
               "update": "${{ needs.update-package.result }}",
               "verify": "${{ needs.verify-sha.result }}",
-              "record": "${{ needs.record-release.result }}",
               "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             }
 
