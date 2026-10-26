@@ -40,6 +40,11 @@ concurrency:
 
 env:
   AZURE_DIR: azure
+  # The chart is NOT committed under azure/. It lives in its normal place in the
+  # repo and is copied into azure/ at build time, so there is one source of
+  # truth for the chart and no risk of the two copies drifting apart.
+  CHART_NAME: amazon-cloudwatch-observability
+  CHART_SRC: charts/amazon-cloudwatch-observability
   CPA_IMAGE: mcr.microsoft.com/container-package-app:latest
 
 jobs:
@@ -106,13 +111,50 @@ jobs:
       - name: Verify expected repo layout
         run: |
           set -euo pipefail
+          # Static Marketplace files, committed under azure/.
           for f in "${AZURE_DIR}/manifest.yaml" \
                    "${AZURE_DIR}/mainTemplate.json" \
                    "${AZURE_DIR}/createUIDefinition.json" \
-                   "${AZURE_DIR}/amazon-cloudwatch-observability/Chart.yaml"; do
-            [[ -e "$f" ]] || { echo "::error::missing required file: $f"; exit 1; }
+                   "${AZURE_DIR}/README.md"; do
+            [[ -f "$f" ]] || { echo "::error::missing required file: $f"; exit 1; }
           done
+          # Chart source, copied in by the next step.
+          [[ -f "${CHART_SRC}/Chart.yaml" ]] || {
+            echo "::error::chart source not found at ${CHART_SRC}/Chart.yaml"; exit 1; }
           echo "Layout OK"
+
+      - name: Stage chart into azure/
+        run: |
+          set -euo pipefail
+          DEST="${AZURE_DIR}/${CHART_NAME}"
+          # Remove any stale copy so a renamed or deleted chart file cannot
+          # survive into the bundle.
+          rm -rf "$DEST"
+          cp -R "${CHART_SRC}" "$DEST"
+
+          # Assert the copy actually landed - cp can partially succeed.
+          [[ -f "${DEST}/Chart.yaml" ]]  || { echo "::error::staging failed: ${DEST}/Chart.yaml"; exit 1; }
+          [[ -f "${DEST}/values.yaml" ]] || { echo "::error::staging failed: ${DEST}/values.yaml"; exit 1; }
+          [[ -d "${DEST}/templates" ]]   || { echo "::error::staging failed: ${DEST}/templates"; exit 1; }
+
+          CHART_VERSION=$(grep -E '^version:' "${DEST}/Chart.yaml" | head -1 | awk '{print $2}' | tr -d '"')
+          echo "Staged ${CHART_SRC} -> ${DEST} (chart version ${CHART_VERSION})"
+
+          # Informational: the release tag and the chart version should normally
+          # match. Not a hard gate, since the tag scheme may differ by design.
+          if [[ "$CHART_VERSION" != "${{ steps.meta.outputs.tag }}" ]]; then
+            echo "::warning::chart version ${CHART_VERSION} != release version ${{ steps.meta.outputs.tag }}"
+          fi
+          {
+            echo "### Chart staged"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| source | \`${CHART_SRC}\` |"
+            echo "| destination | \`${DEST}\` |"
+            echo "| chart version | \`${CHART_VERSION}\` |"
+            echo "| release version | \`${{ steps.meta.outputs.tag }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Azure login (OIDC)
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
