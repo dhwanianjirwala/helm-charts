@@ -10,3 +10,8 @@ bin
 .terraform.lock.hcl
 *.tfstate
 *.tfstate.backup
+
+# Chart staged into azure/ at build time by the Azure Marketplace release
+# workflow. The chart's source of truth is charts/amazon-cloudwatch-observability;
+# committing this copy would let the two drift apart.
+azure/amazon-cloudwatch-observability/
