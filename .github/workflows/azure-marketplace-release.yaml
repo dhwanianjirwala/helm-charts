@@ -1,0 +1,344 @@
+name: Azure Marketplace Release
+
+# Publishes the amazon-cloudwatch-observability chart to Azure Marketplace as a
+# Kubernetes application (CNAB bundle), triggered by a release tag.
+#
+#   1. Build the Marketplace bundle with CPA and push it to ACR
+#   2. Replace the plan's technical-configuration package (delete + add)
+#   3. Verify the digest Partner Center reports matches what we built
+#
+# Final publication stays MANUAL in Partner Center once Azure-side validation
+# passes. This workflow never calls go-live.
+#
+# Auth is GitHub OIDC -> Microsoft Entra ID (no long-lived secrets):
+#   https://learn.microsoft.com/en-us/azure/developer/github/connect-from-azure-openid-connect
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (defaults to the triggering ref)'
+        required: false
+        type: string
+      dry_run:
+        description: 'Build and push to ACR only; do not touch Partner Center'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # required for OIDC federation to Entra ID
+
+# Two releases must never race each other into the same plan.
+concurrency:
+  group: azure-marketplace-release
+  cancel-in-progress: false
+
+env:
+  AZURE_DIR: azure
+  CPA_IMAGE: mcr.microsoft.com/container-package-app:latest
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Fires immediately so the team knows a release started.
+  # ---------------------------------------------------------------------------
+  notify-start:
+    name: Notify - started
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Mapped at job level: the `secrets` context is not available in step `if`.
+    env:
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL_MARKETPLACE }}
+    steps:
+      - name: Slack
+        if: env.SLACK_WEBHOOK != ''
+        uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v2.1.1
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL_MARKETPLACE }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": ":rocket: Azure Marketplace release started",
+              "tag": "${{ inputs.tag || github.ref_name }}",
+              "dry_run": "${{ inputs.dry_run || false }}",
+              "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+
+  # ---------------------------------------------------------------------------
+  # 1. Build the Marketplace bundle and push it to ACR.
+  # ---------------------------------------------------------------------------
+  build-bundle:
+    name: Build bundle and push to ACR
+    # ubuntu-latest is linux/amd64 with Docker preinstalled, which CPA requires.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: meta
+        run: |
+          set -euo pipefail
+          RAW="${{ inputs.tag || github.ref_name }}"
+          if [[ -z "$RAW" ]]; then
+            echo "::error::could not determine a release tag"
+            exit 1
+          fi
+          # Marketplace plan versions are integer.integer.integer - strip any "v".
+          VERSION="${RAW#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag '$RAW' does not yield a Marketplace version (x.y.z), got '$VERSION'"
+            exit 1
+          fi
+          echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Release version: $VERSION"
+
+      - name: Verify expected repo layout
+        run: |
+          set -euo pipefail
+          for f in "${AZURE_DIR}/manifest.yaml" \
+                   "${AZURE_DIR}/mainTemplate.json" \
+                   "${AZURE_DIR}/createUIDefinition.json" \
+                   "${AZURE_DIR}/amazon-cloudwatch-observability/Chart.yaml"; do
+            [[ -e "$f" ]] || { echo "::error::missing required file: $f"; exit 1; }
+          done
+          echo "Layout OK"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR login
+        run: |
+          set -euo pipefail
+          az acr login -n "${{ vars.ACR_NAME }}"
+
+      - name: Build Marketplace bundle (CPA)
+        run: |
+          set -euo pipefail
+          # NOTE: no -it here. The documented command uses -it, which fails in CI
+          # because the runner has no TTY.
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${GITHUB_WORKSPACE}:/data" \
+            -v "${HOME}/.docker:/root/.docker" \
+            -w "/data/${AZURE_DIR}" \
+            --entrypoint /bin/bash \
+            "${CPA_IMAGE}" \
+            -c "cpa buildbundle"
+
+      - name: Resolve bundle digest from ACR
+        id: digest
+        run: |
+          set -euo pipefail
+          REPO="${{ vars.ACR_REPOSITORY }}"
+          TAG="${{ steps.meta.outputs.tag }}"
+          DIGEST=$(az acr manifest show-metadata \
+            --registry "${{ vars.ACR_NAME }}" \
+            --name "${REPO}:${TAG}" \
+            --query digest -o tsv)
+          # Assert on the value, not just the exit code.
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::bundle not found in ACR or digest malformed: '${DIGEST}'"
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Bundle pushed"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| registry | \`${{ vars.ACR_NAME }}\` |"
+            echo "| repository | \`${REPO}\` |"
+            echo "| tag | \`${TAG}\` |"
+            echo "| digest | \`${DIGEST}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 2. Replace the plan's technical-configuration package.
+  # ---------------------------------------------------------------------------
+  update-package:
+    name: Replace Marketplace package
+    needs: build-bundle
+    if: ${{ !(inputs.dry_run || false) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: azure-marketplace # gate reviewers/secrets here if desired
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install partnercenter CLI extension
+        run: |
+          set -euo pipefail
+          # Preview extension - pin via ACR_PARTNERCENTER_EXT_VERSION if you need
+          # reproducibility across runs.
+          az extension add --name partnercenter --only-show-errors
+          az extension show --name partnercenter --query version -o tsv
+
+      - name: Delete existing package
+        run: |
+          set -euo pipefail
+          # A plan with no package yet is not an error; anything else is.
+          if ! OUT=$(az partnercenter marketplace offer plan technical-configuration package delete \
+                --offer-id "${{ vars.MARKETPLACE_OFFER_ID }}" \
+                --plan-id "${{ vars.MARKETPLACE_PLAN_ID }}" \
+                --repository "${{ vars.ACR_REPOSITORY }}" \
+                --tag "${{ needs.build-bundle.outputs.tag }}" 2>&1); then
+            if grep -qiE "not found|does not exist|no package" <<<"$OUT"; then
+              echo "No existing package to delete - continuing."
+            else
+              echo "::error::package delete failed"
+              echo "$OUT"
+              exit 1
+            fi
+          fi
+
+      - name: Add new package
+        run: |
+          set -euo pipefail
+          az partnercenter marketplace offer plan technical-configuration package add \
+            --offer-id "${{ vars.MARKETPLACE_OFFER_ID }}" \
+            --plan-id "${{ vars.MARKETPLACE_PLAN_ID }}" \
+            --registry "${{ vars.ACR_NAME }}" \
+            --repository "${{ vars.ACR_REPOSITORY }}" \
+            --tag "${{ needs.build-bundle.outputs.tag }}" \
+            --digest "${{ needs.build-bundle.outputs.digest }}" \
+            --resource-group "${{ vars.ACR_RESOURCE_GROUP }}" \
+            --subscription-id "${{ vars.AZURE_SUBSCRIPTION_ID }}" \
+            --tenant-id "${{ vars.AZURE_TENANT_ID }}" \
+            --cluster-extension-type "${{ vars.CLUSTER_EXTENSION_TYPE }}"
+
+  # ---------------------------------------------------------------------------
+  # 3. Verify the digest Partner Center reports matches what we built.
+  # ---------------------------------------------------------------------------
+  verify-sha:
+    name: Verify package SHA
+    needs: [build-bundle, update-package]
+    if: ${{ !(inputs.dry_run || false) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install partnercenter CLI extension
+        run: |
+          set -euo pipefail
+          az extension add --name partnercenter --only-show-errors
+
+      - name: Compare digests
+        run: |
+          set -euo pipefail
+          EXPECTED="${{ needs.build-bundle.outputs.digest }}"
+          CONFIG=$(az partnercenter marketplace offer plan technical-configuration show \
+            --offer-id "${{ vars.MARKETPLACE_OFFER_ID }}" \
+            --plan-id "${{ vars.MARKETPLACE_PLAN_ID }}" -o json)
+          echo "$CONFIG" > tech-config.json
+
+          # The digest may sit under different keys across extension versions,
+          # so search the document rather than assuming one path.
+          REPORTED=$(python3 -c "
+          import json,re,sys
+          d=json.load(open('tech-config.json'))
+          found=set()
+          def walk(o):
+              if isinstance(o,dict):
+                  for k,v in o.items(): walk(v)
+              elif isinstance(o,list):
+                  for v in o: walk(v)
+              elif isinstance(o,str) and re.fullmatch(r'sha256:[0-9a-f]{64}',o):
+                  found.add(o)
+          walk(d)
+          print('\n'.join(sorted(found)))
+          ")
+
+          echo "expected: $EXPECTED"
+          echo "reported: ${REPORTED:-<none>}"
+
+          if [[ -z "$REPORTED" ]]; then
+            echo "::error::no sha256 digest found in Partner Center technical configuration"
+            exit 1
+          fi
+          if ! grep -Fxq "$EXPECTED" <<<"$REPORTED"; then
+            echo "::error::digest mismatch - Partner Center does not report the bundle we built"
+            exit 1
+          fi
+          echo "SHA verified."
+          {
+            echo "### SHA verified"
+            echo ""
+            echo "\`${EXPECTED}\`"
+            echo ""
+            echo "Azure-side validation runs next. **Publish manually in Partner Center** once it passes."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Always reports, including on failure, cancellation and timeout.
+  # ---------------------------------------------------------------------------
+  notify-result:
+    name: Notify - result
+    needs: [build-bundle, update-package, verify-sha]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL_MARKETPLACE }}
+    steps:
+      - name: Compute outcome
+        id: outcome
+        run: |
+          set -euo pipefail
+          # Treat cancelled as failure: an unattended pipeline must never read
+          # "cancelled" as "fine".
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" || \
+                "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "state=failure" >> "$GITHUB_OUTPUT"
+            echo "text=:x: Azure Marketplace release FAILED - pipeline stopped" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=success" >> "$GITHUB_OUTPUT"
+            echo "text=:white_check_mark: Azure Marketplace package staged - publish manually in Partner Center" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Slack
+        if: env.SLACK_WEBHOOK != ''
+        uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v2.1.1
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL_MARKETPLACE }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "${{ steps.outcome.outputs.text }}",
+              "tag": "${{ inputs.tag || github.ref_name }}",
+              "build": "${{ needs.build-bundle.result }}",
+              "update": "${{ needs.update-package.result }}",
+              "verify": "${{ needs.verify-sha.result }}",
+              "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+
+      - name: Fail the run if any stage failed
+        if: ${{ steps.outcome.outputs.state == 'failure' }}
+        run: |
+          echo "::error::one or more stages failed - see job results above"
+          exit 1
