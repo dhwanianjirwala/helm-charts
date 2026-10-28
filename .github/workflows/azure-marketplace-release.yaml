@@ -19,8 +19,13 @@ name: Azure Marketplace Release
 # To re-run a release by hand, open "Run workflow" and pick the release TAG as
 # the ref (not main), otherwise the checkout and the version will not agree.
 #
-# Auth is GitHub OIDC -> Microsoft Entra ID (no long-lived secrets):
-#   https://learn.microsoft.com/en-us/azure/developer/github/connect-from-azure-openid-connect
+# RUNNER
+# ------
+# The three Azure jobs run on a self-hosted runner: an Azure VM whose
+# system-assigned managed identity authenticates to Azure. No client secret and
+# no OIDC federation to configure - the VM is itself the credential.
+# The notification jobs stay on GitHub-hosted runners deliberately, so a release
+# still reports failure when the VM is down.
 
 on:
   push:
@@ -40,7 +45,8 @@ on:
 
 permissions:
   contents: read
-  id-token: write # required for OIDC federation to Entra ID
+  # No id-token: write - managed identity does not use GitHub OIDC. Restore it
+  # if auth ever moves back to a federated app registration.
 
 # Two releases must never race each other into the same plan.
 concurrency:
@@ -87,8 +93,8 @@ jobs:
   # ---------------------------------------------------------------------------
   build-bundle:
     name: Build bundle and push to ACR
-    # ubuntu-latest is linux/amd64 with Docker preinstalled, which CPA requires.
-    runs-on: ubuntu-latest
+    # Self-hosted Azure VM: linux/amd64 with Docker, which CPA requires.
+    runs-on: [self-hosted, linux, x64, azure-marketplace]
     timeout-minutes: 60
     outputs:
       version: ${{ steps.meta.outputs.version }}
@@ -174,10 +180,11 @@ jobs:
             echo "| version | \`${VERSION}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Azure login (OIDC)
+      - name: Azure login (VM managed identity)
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
         with:
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          # Reads the runner VM's system-assigned identity from Azure IMDS.
+          auth-type: IDENTITY
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
@@ -235,16 +242,17 @@ jobs:
     name: Replace Marketplace package
     needs: build-bundle
     if: ${{ !(inputs.dry_run || false) }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, azure-marketplace]
     timeout-minutes: 60
     environment: azure-marketplace # gate reviewers/secrets here if desired
     env:
       VERSION: ${{ needs.build-bundle.outputs.version }}
     steps:
-      - name: Azure login (OIDC)
+      - name: Azure login (VM managed identity)
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
         with:
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          # Reads the runner VM's system-assigned identity from Azure IMDS.
+          auth-type: IDENTITY
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
@@ -296,13 +304,14 @@ jobs:
     name: Verify package SHA
     needs: [build-bundle, update-package]
     if: ${{ !(inputs.dry_run || false) }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, azure-marketplace]
     timeout-minutes: 30
     steps:
-      - name: Azure login (OIDC)
+      - name: Azure login (VM managed identity)
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
         with:
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          # Reads the runner VM's system-assigned identity from Azure IMDS.
+          auth-type: IDENTITY
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
